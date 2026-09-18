@@ -68,3 +68,42 @@ class AcquireResponse(_LeaseBase):
 
 class LeaseStatusResponse(_LeaseBase):
     active: bool
+    # Nullable: leases that never reported progress (including every lease
+    # predating the progress feature) expose null for both fields.
+    last_command_sequence: int | None = None
+    last_progress_at: datetime | None = None
+
+    @field_serializer("last_progress_at", when_used="always")
+    def _serialize_progress_iso8601(self, value: datetime | None) -> str | None:
+        return value.isoformat() if value is not None else None
+
+
+class ProgressRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Non-negative JSON integer (text digits and booleans are rejected), kept
+    # inside signed BIGINT so the database column can never overflow.
+    sequence: StrictInt = Field(
+        ...,
+        ge=0,
+        le=(2**63) - 1,
+        description="已执行到的指令序号（非负 JSON 整数，不接受文本数字），只允许递增。",
+    )
+
+
+class ProgressResponse(BaseModel):
+    """Confirmation of the command sequence the holder has reached.
+
+    ``replay`` mirrors acquisition semantics: re-reporting the current
+    sequence is a replay and returns the original record time instead of
+    writing a new one.
+    """
+
+    lease_token: str
+    last_command_sequence: int
+    last_progress_at: datetime
+    replay: bool = False
+
+    @field_serializer("last_progress_at", when_used="always")
+    def _serialize_iso8601(self, value: datetime) -> str:
+        return value.isoformat()

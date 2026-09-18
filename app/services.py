@@ -201,6 +201,7 @@ def get_lease_by_token(conn: Connection, token: str) -> dict[str, Any] | None:
             """
             SELECT id AS lease_id, antenna_id, controller,
                    token, acquired_at, expires_at,
+                   last_command_sequence, last_progress_at,
                    (expires_at > clock_timestamp()) AS active
             FROM leases
             WHERE token = :token
@@ -209,3 +210,129 @@ def get_lease_by_token(conn: Connection, token: str) -> dict[str, Any] | None:
         {"token": token},
     ).mappings().first()
     return dict(row) if row is not None else None
+
+
+def report_lease_progress(
+    conn: Connection,
+    *,
+    token: str,
+    sequence: int,
+) -> dict[str, Any]:
+    """Record how far the current holder of a lease has executed.
+
+    Runs in the caller's READ COMMITTED transaction:
+
+    1. Resolve the token (unknown token -> ``LEASE_NOT_FOUND``, no writes).
+    2. ``SELECT ... FROM antennas ... FOR UPDATE`` on the lease's antenna —
+       the same lock acquisition takes, so progress reports serialise against
+       handovers and against each other.
+    3. Re-read the lease under the lock and let the database clock decide
+       whether it is still the current, unexpired holder. An expired token
+       is rejected (``LEASE_EXPIRED``) without touching any row — even a
+       replay of its last confirmed sequence.
+    4. Monotonicity: a higher sequence is recorded with
+       ``last_progress_at = clock_timestamp()``; the same sequence is a
+       replay and returns the original record time unchanged; a smaller
+       sequence is a stable ``PROGRESS_REGRESSION`` conflict.
+
+    Reporting progress never modifies ``expires_at``: watching a pass cannot
+    extend the occupation of the antenna.
+    """
+    # Defence in depth, mirroring acquire_lease: Pydantic enforces this at
+    # the HTTP boundary, the service re-checks any internal caller before
+    # issuing a write.
+    if not (isinstance(sequence, int) and sequence >= 0):
+        raise APIError(
+            422,
+            "SEQUENCE_OUT_OF_RANGE",
+            "指令序号必须为非负整数。",
+            {"sequence": sequence},
+        )
+
+    # 1. Resolve the token. No row is locked yet: everything that follows
+    #    re-validates under the antenna lock.
+    lease = conn.execute(
+        text("SELECT id, antenna_id FROM leases WHERE token = :token"),
+        {"token": token},
+    ).mappings().first()
+    if lease is None:
+        raise APIError(
+            404,
+            "LEASE_NOT_FOUND",
+            "未知租约令牌。",
+            {"lease_token": token},
+        )
+
+    # 2. Serialise against acquisition and sibling progress reports for the
+    #    same antenna (the FK guarantees the antenna row exists).
+    conn.execute(
+        text("SELECT id FROM antennas WHERE id = :antenna_id FOR UPDATE"),
+        {"antenna_id": lease.antenna_id},
+    )
+
+    # 3. Under the lock, the database clock decides whether this token is
+    #    still the current holder. At most one lease per antenna is unexpired
+    #    at any moment, so an unexpired row IS the current one.
+    row = conn.execute(
+        text(
+            """
+            SELECT id, expires_at, last_command_sequence, last_progress_at,
+                   (expires_at > clock_timestamp()) AS active
+            FROM leases
+            WHERE id = :lease_id
+            FOR UPDATE
+            """
+        ),
+        {"lease_id": lease.id},
+    ).mappings().one()
+
+    if not row.active:
+        raise APIError(
+            409,
+            "LEASE_EXPIRED",
+            "租约已到期，控制权已交接，拒绝上报进度。",
+            {"lease_token": token, "expires_at": row.expires_at.isoformat()},
+        )
+
+    # 4. Monotonic update / replay / regression.
+    last = row.last_command_sequence
+    if last is not None:
+        if sequence < last:
+            raise APIError(
+                409,
+                "PROGRESS_REGRESSION",
+                "指令序号不允许回退。",
+                {
+                    "lease_token": token,
+                    "last_command_sequence": last,
+                    "sequence": sequence,
+                },
+            )
+        if sequence == last:
+            # Replay: the original record time is returned as-is and no
+            # write happens, so repeated reports are byte-identical.
+            return {
+                "lease_token": token,
+                "last_command_sequence": last,
+                "last_progress_at": row.last_progress_at,
+                "replay": True,
+            }
+
+    updated = conn.execute(
+        text(
+            """
+            UPDATE leases
+            SET last_command_sequence = :sequence,
+                last_progress_at = clock_timestamp()
+            WHERE id = :lease_id
+            RETURNING last_command_sequence, last_progress_at
+            """
+        ),
+        {"sequence": sequence, "lease_id": lease.id},
+    ).mappings().one()
+    return {
+        "lease_token": token,
+        "last_command_sequence": updated.last_command_sequence,
+        "last_progress_at": updated.last_progress_at,
+        "replay": False,
+    }
