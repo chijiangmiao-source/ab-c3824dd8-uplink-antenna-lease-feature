@@ -25,3 +25,6 @@ DATABASE_URL: str = _database_url()
 # Inclusive lease duration bounds in seconds.
 MIN_LEASE_SECONDS: int = 5
 MAX_LEASE_SECONDS: int = 120
+
+# Command progress sequences are non-negative and stored in a BIGINT column.
+MAX_COMMAND_SEQUENCE: int = 2**63 - 1

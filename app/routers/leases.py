@@ -7,8 +7,14 @@ from sqlalchemy.orm import Session
 
 from app.db import engine
 from app.errors import APIError
-from app.schemas import AcquireRequest, AcquireResponse, LeaseStatusResponse
-from app.services import acquire_lease, get_lease_by_token
+from app.schemas import (
+    AcquireRequest,
+    AcquireResponse,
+    LeaseStatusResponse,
+    ProgressReportRequest,
+    ProgressReportResponse,
+)
+from app.services import acquire_lease, get_lease_by_token, report_progress
 
 router = APIRouter(tags=["leases"])
 
@@ -62,4 +68,28 @@ def lease_status(lease_token: str, session: Session = Depends(get_session)):
     # expose the token as ``lease_token``).
     result.pop("lease_id", None)
     result["lease_token"] = result.pop("token")
+    return result
+
+
+@router.post(
+    "/leases/{lease_token}/progress",
+    response_model=ProgressReportResponse,
+    status_code=200,
+    summary="上报当前持有方的指令执行进度",
+)
+def report_lease_progress(
+    lease_token: str,
+    payload: ProgressReportRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        result = report_progress(
+            session.connection(),
+            token=lease_token,
+            sequence=payload.sequence,
+        )
+    except APIError:
+        session.rollback()
+        raise
+    session.commit()
     return result

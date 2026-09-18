@@ -14,8 +14,27 @@ from app.main import app
 from app.schemas import AcquireResponse, LeaseStatusResponse
 
 
+def _registered_paths() -> set[str | None]:
+    """Collect every route path, across FastAPI layouts.
+
+    Newer FastAPI versions nest included routers (``_IncludedRouter`` wraps
+    the ``original_router``) instead of flattening them into ``app.routes``;
+    older ones expose plain ``APIRoute`` entries. Walk both shapes.
+    """
+    paths: set[str | None] = set()
+    stack = list(app.routes)
+    while stack:
+        route = stack.pop()
+        paths.add(getattr(route, "path", None))
+        stack.extend(getattr(route, "routes", None) or ())
+        original = getattr(route, "original_router", None)
+        if original is not None:
+            stack.extend(original.routes)
+    return paths
+
+
 def test_app_module_imports_and_routes_are_registered():
-    paths = {getattr(r, "path", None) for r in app.routes}
+    paths = _registered_paths()
     assert "/leases" in paths
     assert "/leases/{lease_token}" in paths
     assert "/health" in paths

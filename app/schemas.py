@@ -13,7 +13,11 @@ from pydantic import (
     field_validator,
 )
 
-from app.config import MAX_LEASE_SECONDS, MIN_LEASE_SECONDS
+from app.config import (
+    MAX_COMMAND_SEQUENCE,
+    MAX_LEASE_SECONDS,
+    MIN_LEASE_SECONDS,
+)
 
 
 class AcquireRequest(BaseModel):
@@ -68,3 +72,33 @@ class AcquireResponse(_LeaseBase):
 
 class LeaseStatusResponse(_LeaseBase):
     active: bool
+    # Null until the holder's first progress report; historical leases
+    # (pre-progress-migration) therefore also read as null.
+    last_command_sequence: int | None = None
+    last_progress_at: datetime | None = None
+
+    @field_serializer("last_progress_at", when_used="always")
+    def _serialize_optional_iso8601(self, value: datetime | None) -> str | None:
+        return value.isoformat() if value is not None else None
+
+
+class ProgressReportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sequence: StrictInt = Field(
+        ...,
+        ge=0,
+        le=MAX_COMMAND_SEQUENCE,
+        description="已执行到的指令序号（必须是 JSON 整数，不接受文本数字），非负。",
+    )
+
+
+class ProgressReportResponse(BaseModel):
+    lease_token: str
+    last_command_sequence: int
+    last_progress_at: datetime
+    replay: bool = False
+
+    @field_serializer("last_progress_at", when_used="always")
+    def _serialize_iso8601(self, value: datetime) -> str:
+        return value.isoformat()

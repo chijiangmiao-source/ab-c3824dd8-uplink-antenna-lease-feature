@@ -107,6 +107,11 @@ alembic downgrade base    # 回滚全部迁移
 - `idempotency_keys(idempotency_key PK, lease_id FK NOT NULL,
   request_params, created_at)`。
 
+`alembic/versions/0002_lease_progress.py` 为 `leases` 增加可空的
+`last_command_sequence`（BIGINT，校验非负）与 `last_progress_at`
+（timestamptz），并校验两列同增同减（要么同时为 NULL，要么同时有值）。
+历史记录保持 NULL，无需补造进度。
+
 ---
 
 ## 4. 调用方法
@@ -165,10 +170,12 @@ curl -sS -X POST http://localhost:8000/leases \
 | HTTP | code | 触发条件 | 是否落库 |
 | --- | --- | --- | --- |
 | 404 | `ANTENNA_NOT_FOUND` | 未知天线编号 | 否 |
-| 422 | `VALIDATION_ERROR` | 租期越界（非 5–120 整数）、缺字段、空白、多余字段 | 否 |
+| 422 | `VALIDATION_ERROR` | 租期越界（非 5–120 整数）、缺字段、空白、多余字段、进度序号为负/非整数 | 否 |
 | 409 | `ANTENNA_BUSY` | 存在未到期租约（`details.expires_at` 给出交接时间） | 否 |
 | 409 | `IDEMPOTENCY_CONFLICT` | 同幂等键但参数与首次不同 | 否（首次成功请求的记录保留） |
-| 404 | `LEASE_NOT_FOUND` | `GET /leases/{token}` 令牌未知 | 否 |
+| 404 | `LEASE_NOT_FOUND` | `GET /leases/{token}` 或进度上报的令牌未知 | 否 |
+| 409 | `LEASE_EXPIRED` | 进度上报时租约已到期、令牌不再持有控制权 | 否 |
+| 409 | `PROGRESS_REGRESSION` | 上报序号小于已确认序号（`details` 含当前已确认序号） | 否 |
 
 `ANTENNA_BUSY` 示例：
 
@@ -192,9 +199,51 @@ curl -sS -X POST http://localhost:8000/leases \
 ### 4.3 其他接口
 
 - `GET /leases/{lease_token}` — 查询租约与 `active` 状态（以数据库时间实时计算）；
+  响应另含可空的 `last_command_sequence` 与 `last_progress_at`：
+  持有方尚未上报进度时（含迁移前的历史租约）两者均为 `null`；
 - `GET /antennas` — 预置天线目录；
 - `GET /health` — 存活探针，返回数据库时钟 `database_time`；
 - 交互式文档：`GET /docs`（Swagger UI）。
+
+### 4.4 上报指令执行进度 `POST /leases/{lease_token}/progress`
+
+一次过站中控制程序会连续下发多条指令；值班人员通过 `GET` 查询确认当前持有方
+已执行到哪一条。上报**只记录进度，不改变租约的占用期限**
+（`acquired_at` / `expires_at` 不受影响）。
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `sequence` | int | 已执行到的指令序号，非负整数（JSON 整数，不接受文本数字） |
+
+成功 `200`：
+
+```json
+{
+  "lease_token": "k3J9...",
+  "last_command_sequence": 41,
+  "last_progress_at": "2026-09-12T04:00:10.654321+00:00",
+  "replay": false
+}
+```
+
+- 上报事务锁定租约所属天线行（与获取租约同一把锁），确认该令牌仍为
+  **当前未到期租约**后才写入；`last_progress_at` 由数据库时钟
+  `clock_timestamp()` 生成；
+- 序号必须**递增**；相同序号视为重放（响应可能丢失后的安全重试），
+  返回 `replay: true` 与**原记录时间**，不改写数据；
+- 更小序号返回 `409 PROGRESS_REGRESSION`；令牌未知返回 `404 LEASE_NOT_FOUND`；
+  租约已到期返回 `409 LEASE_EXPIRED`——三类拒绝均**不写库**；
+- 并发上报在数据库锁下串行化，最终保留最大序号。
+
+curl：
+
+```bash
+curl -sS -X POST http://localhost:8000/leases/k3J9.../progress \
+  -H 'Content-Type: application/json' \
+  -d '{"sequence": 41}'
+```
 
 ---
 
@@ -212,6 +261,17 @@ curl -sS -X POST http://localhost:8000/leases \
 5. 插入新租约与幂等记录并提交（同事务原子完成）。
 
 所有“当前时间”和到期时间都在 SQL 内由 PostgreSQL 产生，应用层没有任何时间判断。
+
+进度上报（`POST /leases/{token}/progress`）复用同一把天线行锁：
+
+1. 按令牌找到租约（未知令牌在任何加锁/写入之前返回 404）；
+2. `SELECT ... FROM antennas ... FOR UPDATE` 锁定租约所属天线，
+   与获取、其他上报串行化；
+3. 单条带守卫的 `UPDATE`：仅当 `expires_at > clock_timestamp()`（该租约仍是
+   当前未到期租约——由获取协议保证每副天线至多一个）且序号严格大于已存值时，
+   写入 `(last_command_sequence, last_progress_at = clock_timestamp())`；
+4. 未命中则在同一把锁内重读分类：已到期 → `LEASE_EXPIRED`；
+   序号相同 → 重放原记录时间；序号更小 → `PROGRESS_REGRESSION`。
 
 ---
 
@@ -242,7 +302,10 @@ pytest
   在任者不被改写、同键并发自身重试只有一份租约、发散参数 fanout、
   多天线互不干扰、连续争抢波；
 - `tests/test_expiry.py` — SQL 造到期租约验证原子交接、到期边界归新请求、
-  以及经 API 的 5 秒最短租约端到端到期交接。
+  以及经 API 的 5 秒最短租约端到端到期交接；
+- `tests/test_progress.py` — 获取后连续上报并查询最新进度、同序号重放记录时间稳定、
+  更小序号 `PROGRESS_REGRESSION`、并发上报最终保留最大序号、过期/被接替/未知令牌
+  拒绝且数据不变、历史租约进度字段为 null、序号输入校验零落库。
 
 测试不使用任何固定响应或假接口：全部通过 HTTP 打向真实服务，并直连真实
 PostgreSQL 制造并发、播种到期数据和断言提交结果。
